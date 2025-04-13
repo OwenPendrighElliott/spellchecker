@@ -1,3 +1,4 @@
+use cachers::{Cache, LFUCache};
 use rayon::prelude::*;
 use serde_json;
 use std::collections::{HashMap, HashSet};
@@ -77,82 +78,93 @@ pub enum SuggestedCorrection {
     Suggestions(Vec<Suggestion>),
 }
 
-#[derive(Debug, Clone)]
 pub struct SpellCorrector {
-    dictionary: HashSet<String>,
-    dictionary_del_mappings: HashMap<String, Vec<String>>, // deletion edits -> correct words
-    max_edit_distance: usize,                              // maximum edit distance to consider
+    dictionary: Vec<String>,
+    lkp_dictionary: HashSet<String>, // for fast lookup
+    dictionary_del_mappings: HashMap<String, Vec<usize>>, // deletion edits -> correct word indices
+    max_edit_distance: usize,        // maximum edit distance to consider
+    cache: LFUCache<String, Vec<Suggestion>>, // cache for suggestions
 }
 
 impl SpellCorrector {
-    pub fn new(dictionary: HashSet<String>, max_edit_distance: usize) -> Self {
+    pub fn new(dictionary: Vec<String>, max_edit_distance: usize) -> Self {
         let mut dictionary_del_mappings = HashMap::new();
-        for word in &dictionary {
+        let mut lkp_dictionary: HashSet<String> = dictionary.iter().cloned().collect();
+        for (i, word) in dictionary.iter().enumerate() {
             let deletions = deletion_variants(word, max_edit_distance, true);
             for del_word in &deletions {
                 dictionary_del_mappings
                     .entry(del_word.clone())
                     .or_insert_with(Vec::new)
-                    .push(word.clone());
+                    .push(i);
             }
+            lkp_dictionary.insert(word.clone());
         }
         SpellCorrector {
             dictionary,
+            lkp_dictionary,
             dictionary_del_mappings,
             max_edit_distance,
+            cache: LFUCache::new(10000), // cache size of 10000
         }
     }
 
     pub fn from_word_list_file(file_path: &str, max_edit_distance: usize) -> Self {
         let content = fs::read_to_string(file_path).expect("Unable to read dictionary file");
-        let dictionary: HashSet<String> = content
+        let dictionary: Vec<String> = content
             .lines()
             .map(|s| s.to_string().to_lowercase())
             .collect();
         Self::new(dictionary, max_edit_distance)
     }
 
-    pub fn save_spell_corrector(&self, file_path: &str) -> Result<(), std::io::Error> {
-        let del_mapping_json = serde_json::to_string(&self.dictionary_del_mappings);
-
-        match del_mapping_json {
-            Ok(json) => {
-                fs::write(file_path, json)?;
-                Ok(())
-            }
-            Err(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize dictionary mappings: {}", e),
-            )),
-        }
+    pub fn save_spell_corrector(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let data = serde_json::json!({
+            "dictionary": self.dictionary,
+            "dictionary_del_mappings": self.dictionary_del_mappings,
+            "max_edit_distance": self.max_edit_distance,
+        });
+        fs::write(file_path, data.to_string())?;
+        Ok(())
     }
 
-    pub fn load_spell_corrector(file_path: &str, max_edit_distance: usize) -> Self {
+    pub fn load_spell_corrector(file_path: &str) -> Self {
         let content = fs::read_to_string(file_path).expect("Unable to read dictionary file");
-        let dictionary_del_mappings: HashMap<String, Vec<String>> =
-            serde_json::from_str(&content).expect("Failed to deserialize dictionary mappings");
-        let mut dictionary = HashSet::new();
-        for words in dictionary_del_mappings.values() {
-            for word in words {
-                dictionary.insert(word.clone());
-            }
+        let data: serde_json::Value = serde_json::from_str(&content).expect("Unable to parse JSON");
+        let dictionary: Vec<String> =
+            serde_json::from_value(data["dictionary"].clone()).expect("Unable to parse dictionary");
+        let dictionary_del_mappings: HashMap<String, Vec<usize>> =
+            serde_json::from_value(data["dictionary_del_mappings"].clone())
+                .expect("Unable to parse dictionary deletion mappings");
+
+        let max_edit_distance: usize = serde_json::from_value(data["max_edit_distance"].clone())
+            .expect("Unable to parse max edit distance");
+
+        let mut lkp_dictionary = HashSet::new();
+        for word in &dictionary {
+            lkp_dictionary.insert(word.clone());
         }
+
         SpellCorrector {
             dictionary,
+            lkp_dictionary,
             dictionary_del_mappings,
             max_edit_distance,
+            cache: LFUCache::new(10000), // cache size of 10000
         }
     }
 
     pub fn add_word_to_dictionary(&mut self, word: &str) {
-        self.dictionary.insert(word.to_string());
+        self.dictionary.push(word.to_string());
         let deletions = deletion_variants(word, self.max_edit_distance, true);
         for del_word in &deletions {
             self.dictionary_del_mappings
                 .entry(del_word.clone())
                 .or_insert_with(Vec::new)
-                .push(word.to_string());
+                .push(self.dictionary.len() - 1);
         }
+        self.lkp_dictionary.insert(word.to_string());
+        self.cache.clear(); // clear the cache when adding a new word
     }
 
     pub fn suggest_single_word_corrections(
@@ -160,8 +172,20 @@ impl SpellCorrector {
         word: &str,
         n_suggestions: usize,
     ) -> SuggestedCorrection {
-        if self.dictionary.contains(word) {
+        if self.lkp_dictionary.contains(word) {
             return SuggestedCorrection::NoSuggestions;
+        }
+
+        if let Some(cached_suggestions) = self.cache.get(&word.to_string()) {
+            if cached_suggestions.len() > n_suggestions {
+                return SuggestedCorrection::Suggestions(
+                    cached_suggestions
+                        .iter()
+                        .take(n_suggestions)
+                        .cloned()
+                        .collect(),
+                );
+            }
         }
 
         let word_deletions = deletion_variants(word, self.max_edit_distance, false);
@@ -176,10 +200,11 @@ impl SpellCorrector {
         let mut suggestions: Vec<Suggestion> = candidates
             .into_iter()
             .filter_map(|candidate| {
-                let distance = bounded_levenshtein(word, &candidate, self.max_edit_distance);
+                let distance =
+                    bounded_levenshtein(word, &self.dictionary[candidate], self.max_edit_distance);
                 if distance <= self.max_edit_distance {
                     Some(Suggestion {
-                        word: candidate,
+                        word: self.dictionary[candidate].clone(),
                         distance,
                     })
                 } else {
@@ -196,6 +221,8 @@ impl SpellCorrector {
         });
 
         suggestions.truncate(n_suggestions);
+
+        self.cache.set(word.to_string(), suggestions.clone());
 
         SuggestedCorrection::Suggestions(suggestions.into_iter().collect())
     }
@@ -234,9 +261,9 @@ mod tests {
 
     #[test]
     fn test_suggest_single_word_corrections() {
-        let mut dictionary: HashSet<String> = HashSet::new();
-        dictionary.insert("spelling".to_string());
-        dictionary.insert("corrected".to_string());
+        let mut dictionary: Vec<String> = Vec::new();
+        dictionary.push("spelling".to_string());
+        dictionary.push("corrected".to_string());
 
         let spell_corrector = SpellCorrector::new(dictionary, 2);
         let suggestions = spell_corrector.suggest_single_word_corrections("speling", 2);
@@ -280,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_suggest_multiple_corrections_order() {
-        let dict: HashSet<String> = ["spelling", "spilling", "selling"]
+        let dict: Vec<String> = ["spelling", "spilling", "selling"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -303,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_add_word_updates_dictionary() {
-        let dict: HashSet<String> = ["cat"].iter().map(|s| s.to_string()).collect();
+        let dict: Vec<String> = ["cat"].iter().map(|s| s.to_string()).collect();
         let mut corrector = SpellCorrector::new(dict, 1);
 
         println!(

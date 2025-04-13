@@ -7,6 +7,7 @@ edition = "2024"
 rayon = "1"
 serde = "1"
 serde_json = "1"
+cachers = { git = "https://github.com/OwenPendrighElliott/cachers.git" }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
@@ -19,3 +20,8 @@ harness = false
 [[bench]]
 name = "bench_spell_check_string"
 harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
