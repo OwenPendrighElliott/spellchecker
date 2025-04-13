@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
@@ -102,13 +103,45 @@ impl SpellCorrector {
         }
     }
 
-    pub fn from_file(file_path: &str, max_edit_distance: usize) -> Self {
+    pub fn from_word_list_file(file_path: &str, max_edit_distance: usize) -> Self {
         let content = fs::read_to_string(file_path).expect("Unable to read dictionary file");
         let dictionary: HashSet<String> = content
             .lines()
             .map(|s| s.to_string().to_lowercase())
             .collect();
         Self::new(dictionary, max_edit_distance)
+    }
+
+    pub fn save_spell_corrector(&self, file_path: &str) -> Result<(), std::io::Error> {
+        let del_mapping_json = serde_json::to_string(&self.dictionary_del_mappings);
+
+        match del_mapping_json {
+            Ok(json) => {
+                fs::write(file_path, json)?;
+                Ok(())
+            }
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize dictionary mappings: {}", e),
+            )),
+        }
+    }
+
+    pub fn load_spell_corrector(file_path: &str, max_edit_distance: usize) -> Self {
+        let content = fs::read_to_string(file_path).expect("Unable to read dictionary file");
+        let dictionary_del_mappings: HashMap<String, Vec<String>> =
+            serde_json::from_str(&content).expect("Failed to deserialize dictionary mappings");
+        let mut dictionary = HashSet::new();
+        for words in dictionary_del_mappings.values() {
+            for word in words {
+                dictionary.insert(word.clone());
+            }
+        }
+        SpellCorrector {
+            dictionary,
+            dictionary_del_mappings,
+            max_edit_distance,
+        }
     }
 
     pub fn add_word_to_dictionary(&mut self, word: &str) {

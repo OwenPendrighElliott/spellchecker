@@ -3,14 +3,25 @@ use std::fs;
 use std::time::Instant;
 
 fn main() {
-    let dict_file = "words_100k.txt".to_string();
+    let word_list_file = "words_100k.txt".to_string();
+    let dict_spell_corrector_data_file = "benches/dict_spell_corrector_data.json".to_string();
     let text_file = "benches/test_text.txt".to_string();
     let max_edit_distance = 3;
     let max_suggestions = 5;
 
     let text_content = fs::read_to_string(text_file).expect("Unable to read text file, please ensure you have a file named test_text.txt in the current directory with any text contents.");
 
-    let spell_corrector = SpellCorrector::from_file(&dict_file, max_edit_distance);
+    let spell_corrector;
+    // check if the dict_spell_corrector_data_file exists
+    if fs::metadata(&dict_spell_corrector_data_file).is_ok() {
+        spell_corrector = SpellCorrector::load_spell_corrector(
+            &dict_spell_corrector_data_file,
+            max_edit_distance,
+        );
+    } else {
+        spell_corrector = SpellCorrector::from_word_list_file(&word_list_file, max_edit_distance);
+        spell_corrector.save_spell_corrector(&dict_spell_corrector_data_file).expect("Unable to save the spell corrector data file, please check the file path and permissions.");
+    }
 
     // split the text content into words using white spa
     let words: Vec<String> = text_content

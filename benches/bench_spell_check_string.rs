@@ -8,7 +8,7 @@ fn bench_spell_check_string(c: &mut Criterion) {
 
     let text_content = "This is a short sntence with some misspelled wrds. It is used for testing the spell checker functionality.".to_string();
 
-    let spell_corrector = SpellCorrector::from_file(&dict_file, max_edit_distance);
+    let spell_corrector = SpellCorrector::from_word_list_file(&dict_file, max_edit_distance);
 
     // split the text content into words using white spa
     let words: Vec<String> = text_content

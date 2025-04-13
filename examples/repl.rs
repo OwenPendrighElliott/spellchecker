@@ -18,7 +18,7 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
 
-    let corrector = SpellCorrector::from_file(&dict_path, MAX_EDIT_DISTANCE);
+    let corrector = SpellCorrector::from_word_list_file(&dict_path, MAX_EDIT_DISTANCE);
 
     println!(
         "SymSpell REPL - dictionary: {}\n:type text, :q to quit",
